@@ -5,6 +5,233 @@ from torch.nn import Module, Sequential, Linear, Conv1d, ModuleList
 from torch_scatter import scatter_sum, scatter_softmax
 from torch_geometric.nn import radius_graph, knn_graph
 from models.common import GaussianSmearing, MLP, NONLINEARITIES
+import math
+
+
+class CrossAttentionBlock(Module):
+    """
+    Cross-Attention module for ligand-protein interaction.
+    
+    This module enables direct interaction between ligand and protein nodes,
+    providing:
+    1. Long-range interaction capture without multi-hop message passing
+    2. Content-based addressing (not just distance-based)
+    3. Robustness during early diffusion stages when ligand positions are noisy
+    """
+    
+    def __init__(self, node_dim, num_heads=4, dropout=0.1, use_pos_encoding=True, cutoff=10.0):
+        super().__init__()
+        self.node_dim = node_dim
+        self.num_heads = num_heads
+        self.head_dim = node_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.use_pos_encoding = use_pos_encoding
+        self.cutoff = cutoff
+        
+        assert node_dim % num_heads == 0, "node_dim must be divisible by num_heads"
+        
+        # Query, Key, Value projections for ligand (query) attending to protein (key, value)
+        self.q_proj = Linear(node_dim, node_dim)
+        self.k_proj = Linear(node_dim, node_dim)
+        self.v_proj = Linear(node_dim, node_dim)
+        self.out_proj = Linear(node_dim, node_dim)
+        
+        # Optional positional encoding based on 3D distance
+        if use_pos_encoding:
+            self.dist_embedding = GaussianSmearing(start=0.0, stop=cutoff, num_gaussians=32)
+            self.pos_bias_proj = Linear(32, num_heads)
+        
+        # Layer normalization and dropout
+        self.layer_norm_q = nn.LayerNorm(node_dim)
+        self.layer_norm_kv = nn.LayerNorm(node_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # FFN after attention
+        self.ffn = Sequential(
+            Linear(node_dim, node_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            Linear(node_dim * 4, node_dim),
+            nn.Dropout(dropout)
+        )
+        self.layer_norm_ffn = nn.LayerNorm(node_dim)
+    
+    def forward(self, ligand_h, ligand_pos, ligand_batch, 
+                protein_h, protein_pos, protein_batch):
+        """
+        Cross-attention from ligand to protein.
+        
+        Args:
+            ligand_h: (N_lig, node_dim) - Ligand node features
+            ligand_pos: (N_lig, 3) - Ligand node positions  
+            ligand_batch: (N_lig,) - Batch indices for ligand nodes
+            protein_h: (N_prot, node_dim) - Protein node features
+            protein_pos: (N_prot, 3) - Protein node positions
+            protein_batch: (N_prot,) - Batch indices for protein nodes
+            
+        Returns:
+            updated_ligand_h: (N_lig, node_dim) - Updated ligand features
+        """
+        N_lig = ligand_h.size(0)
+        N_prot = protein_h.size(0)
+        device = ligand_h.device
+        
+        # Pre-norm
+        ligand_h_norm = self.layer_norm_q(ligand_h)
+        protein_h_norm = self.layer_norm_kv(protein_h)
+        
+        # Compute Q, K, V
+        Q = self.q_proj(ligand_h_norm).view(N_lig, self.num_heads, self.head_dim)
+        K = self.k_proj(protein_h_norm).view(N_prot, self.num_heads, self.head_dim)
+        V = self.v_proj(protein_h_norm).view(N_prot, self.num_heads, self.head_dim)
+        
+        # Compute attention scores with batch masking
+        # We need to handle variable-size batches efficiently
+        num_graphs = ligand_batch.max().item() + 1
+        
+        # Create batch mask: (N_lig, N_prot) where True means same batch
+        batch_mask = ligand_batch.unsqueeze(1) == protein_batch.unsqueeze(0)  # (N_lig, N_prot)
+        
+        # Compute attention scores: (N_lig, N_prot, num_heads)
+        attn_scores = torch.einsum('lhd,phd->lph', Q, K) * self.scale
+        
+        # Add positional bias if enabled
+        if self.use_pos_encoding:
+            # Compute pairwise distances: (N_lig, N_prot)
+            dist = torch.cdist(ligand_pos, protein_pos, p=2)  # (N_lig, N_prot)
+            dist_clamped = dist.clamp(max=self.cutoff)
+            
+            # Get distance embeddings and project to bias: (N_lig, N_prot, num_heads)
+            dist_flat = dist_clamped.view(-1)
+            dist_emb = self.dist_embedding(dist_flat)  # (N_lig * N_prot, 32)
+            pos_bias = self.pos_bias_proj(dist_emb).view(N_lig, N_prot, self.num_heads)
+            
+            attn_scores = attn_scores + pos_bias
+        
+        # Apply batch mask (set scores to -inf for cross-batch pairs)
+        attn_mask = ~batch_mask  # True where we should mask
+        attn_scores = attn_scores.masked_fill(attn_mask.unsqueeze(-1), float('-inf'))
+        
+        # Softmax over protein dimension
+        attn_weights = F.softmax(attn_scores, dim=1)  # (N_lig, N_prot, num_heads)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Handle NaN from empty protein batches
+        attn_weights = attn_weights.nan_to_num(0.0)
+        
+        # Compute weighted sum of values: (N_lig, num_heads, head_dim)
+        out = torch.einsum('lph,phd->lhd', attn_weights, V)
+        out = out.reshape(N_lig, self.node_dim)
+        out = self.out_proj(out)
+        
+        # Residual connection
+        ligand_h = ligand_h + self.dropout(out)
+        
+        # FFN with residual
+        ligand_h = ligand_h + self.ffn(self.layer_norm_ffn(ligand_h))
+        
+        return ligand_h
+
+
+class EfficientCrossAttentionBlock(Module):
+    """
+    Memory-efficient Cross-Attention with local windowing.
+    
+    For large protein pockets, full attention can be expensive.
+    This version uses distance-based neighbor selection to limit computation.
+    """
+    
+    def __init__(self, node_dim, num_heads=4, dropout=0.1, 
+                 cutoff=10.0, max_neighbors=64):
+        super().__init__()
+        self.node_dim = node_dim
+        self.num_heads = num_heads
+        self.head_dim = node_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.cutoff = cutoff
+        self.max_neighbors = max_neighbors
+        
+        assert node_dim % num_heads == 0
+        
+        self.q_proj = Linear(node_dim, node_dim)
+        self.k_proj = Linear(node_dim, node_dim)
+        self.v_proj = Linear(node_dim, node_dim)
+        self.out_proj = Linear(node_dim, node_dim)
+        
+        self.dist_embedding = GaussianSmearing(start=0.0, stop=cutoff, num_gaussians=32)
+        self.pos_bias_proj = Linear(32, num_heads)
+        
+        self.layer_norm_q = nn.LayerNorm(node_dim)
+        self.layer_norm_kv = nn.LayerNorm(node_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.ffn = Sequential(
+            Linear(node_dim, node_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            Linear(node_dim * 4, node_dim),
+            nn.Dropout(dropout)
+        )
+        self.layer_norm_ffn = nn.LayerNorm(node_dim)
+    
+    def forward(self, ligand_h, ligand_pos, ligand_batch,
+                protein_h, protein_pos, protein_batch):
+        """
+        Efficient cross-attention using sparse neighbor connections.
+        """
+        from torch_geometric.nn import knn
+        
+        N_lig = ligand_h.size(0)
+        device = ligand_h.device
+        
+        # Pre-norm
+        ligand_h_norm = self.layer_norm_q(ligand_h)
+        protein_h_norm = self.layer_norm_kv(protein_h)
+        
+        # Find k-nearest protein neighbors for each ligand atom
+        # knn returns: edge_index where edge_index[0] are protein indices (targets)
+        # and edge_index[1] are ligand indices (sources)
+        edge_index = knn(protein_pos, ligand_pos, k=self.max_neighbors,
+                         batch_x=protein_batch, batch_y=ligand_batch)
+        prot_idx, lig_idx = edge_index  # (E,), (E,)
+        
+        # Compute Q, K, V
+        Q = self.q_proj(ligand_h_norm).view(N_lig, self.num_heads, self.head_dim)
+        K = self.k_proj(protein_h_norm)
+        V = self.v_proj(protein_h_norm)
+        
+        # Gather K, V for each edge
+        K_neighbors = K[prot_idx].view(-1, self.num_heads, self.head_dim)  # (E, heads, head_dim)
+        V_neighbors = V[prot_idx].view(-1, self.num_heads, self.head_dim)
+        Q_expanded = Q[lig_idx]  # (E, heads, head_dim)
+        
+        # Compute attention scores for edges
+        attn_scores = (Q_expanded * K_neighbors).sum(-1) * self.scale  # (E, heads)
+        
+        # Add positional bias
+        dist = torch.norm(ligand_pos[lig_idx] - protein_pos[prot_idx], dim=-1)  # (E,)
+        dist_clamped = dist.clamp(max=self.cutoff)
+        dist_emb = self.dist_embedding(dist_clamped)  # (E, 32)
+        pos_bias = self.pos_bias_proj(dist_emb)  # (E, heads)
+        attn_scores = attn_scores + pos_bias
+        
+        # Softmax over neighbors (grouped by ligand index)
+        attn_weights = scatter_softmax(attn_scores, lig_idx, dim=0)  # (E, heads)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Weighted sum of values
+        weighted_V = attn_weights.unsqueeze(-1) * V_neighbors  # (E, heads, head_dim)
+        out = scatter_sum(weighted_V, lig_idx, dim=0, dim_size=N_lig)  # (N_lig, heads, head_dim)
+        out = out.reshape(N_lig, self.node_dim)
+        out = self.out_proj(out)
+        
+        # Residual connection
+        ligand_h = ligand_h + self.dropout(out)
+        
+        # FFN with residual
+        ligand_h = ligand_h + self.ffn(self.layer_norm_ffn(ligand_h))
+        
+        return ligand_h
 
 
 class NodeBlock(Module):
@@ -319,12 +546,23 @@ class EgnnNet(Module):
         else:
             self.update_pos = True  # default update pos
         
+        # Cross-attention configuration
+        self.use_cross_attention = kwargs.get('use_cross_attention', False)
+        self.cross_attention_freq = kwargs.get('cross_attention_freq', 2)  # Apply every N blocks
+        self.cross_attention_type = kwargs.get('cross_attention_type', 'efficient')  # 'full' or 'efficient'
+        cross_attention_heads = kwargs.get('cross_attention_heads', 4)
+        cross_attention_dropout = kwargs.get('cross_attention_dropout', 0.1)
+        cross_attention_cutoff = kwargs.get('cross_attention_cutoff', cutoff)
+        cross_attention_max_neighbors = kwargs.get('cross_attention_max_neighbors', 64)
+        
         # node network
         self.node_blocks_with_edge = ModuleList()
         self.edge_embs = ModuleList()
         self.edge_blocks = ModuleList()
         self.pos_blocks = ModuleList()
-        for _ in range(num_blocks):
+        self.cross_attention_blocks = ModuleList()
+        
+        for i in range(num_blocks):
             self.node_blocks_with_edge.append(NodeBlock(
                 node_dim=node_dim, edge_dim=edge_dim, hidden_dim=node_dim, use_gate=use_gate,
             ))
@@ -337,8 +575,43 @@ class EgnnNet(Module):
                 self.pos_blocks.append(PosUpdate(
                     node_dim=node_dim, edge_dim=edge_dim, hidden_dim=edge_dim, use_gate=use_gate,
                 ))
+            
+            # Add cross-attention at specified frequency
+            if self.use_cross_attention and (i % self.cross_attention_freq == 0):
+                if self.cross_attention_type == 'full':
+                    self.cross_attention_blocks.append(CrossAttentionBlock(
+                        node_dim=node_dim,
+                        num_heads=cross_attention_heads,
+                        dropout=cross_attention_dropout,
+                        use_pos_encoding=True,
+                        cutoff=cross_attention_cutoff
+                    ))
+                else:  # efficient
+                    self.cross_attention_blocks.append(EfficientCrossAttentionBlock(
+                        node_dim=node_dim,
+                        num_heads=cross_attention_heads,
+                        dropout=cross_attention_dropout,
+                        cutoff=cross_attention_cutoff,
+                        max_neighbors=cross_attention_max_neighbors
+                    ))
+            elif self.use_cross_attention:
+                self.cross_attention_blocks.append(None)  # Placeholder
 
-    def forward(self, node_h, node_pos, edge_h, edge_index, node_time, edge_time, ligand_mask):
+    def forward(self, node_h, node_pos, edge_h, edge_index, node_time, edge_time, ligand_mask, node_batch=None):
+        # Get batch information from edge_index if cross-attention is enabled
+        if self.use_cross_attention:
+            # We need to extract protein and ligand information for cross-attention
+            protein_mask = ~ligand_mask
+            
+            # Derive batch indices for ligand and protein if not provided
+            if node_batch is not None:
+                ligand_batch = node_batch[ligand_mask]
+                protein_batch = node_batch[protein_mask]
+            else:
+                # Fallback: assume single batch
+                ligand_batch = torch.zeros(ligand_mask.sum(), dtype=torch.long, device=node_h.device)
+                protein_batch = torch.zeros(protein_mask.sum(), dtype=torch.long, device=node_h.device)
+            
         for i in range(self.num_blocks):
             # edge fetures before each block
             if self.update_pos or (i==0):
@@ -354,6 +627,25 @@ class EgnnNet(Module):
             if self.update_edge:
                 edge_h = edge_h + self.edge_blocks[i](edge_h, edge_index, node_h, edge_time)
             node_h = node_h + node_h_with_edge
+            
+            # Cross-attention: ligand attends to protein
+            if self.use_cross_attention and self.cross_attention_blocks[i] is not None:
+                # Extract ligand and protein nodes
+                ligand_h = node_h[ligand_mask]
+                ligand_pos_curr = node_pos[ligand_mask]
+                protein_h = node_h[protein_mask]
+                protein_pos_curr = node_pos[protein_mask]
+                
+                # Apply cross-attention
+                updated_ligand_h = self.cross_attention_blocks[i](
+                    ligand_h, ligand_pos_curr, ligand_batch,
+                    protein_h, protein_pos_curr, protein_batch
+                )
+                
+                # Update ligand features in full node tensor
+                node_h = node_h.clone()
+                node_h[ligand_mask] = updated_ligand_h
+            
             # pos updates
             if self.update_pos:
                 delta_pos = self.pos_blocks[i](node_h, edge_h, edge_index, relative_vec, distance, edge_time)

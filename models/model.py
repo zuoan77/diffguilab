@@ -211,7 +211,8 @@ class DiffGui(Module):
             edge_index=all_edge_index,
             node_time=t.index_select(0, all_node_batch).unsqueeze(-1) / self.num_timesteps,
             edge_time=t.index_select(0, all_edge_batch).unsqueeze(-1) / self.num_timesteps,
-            ligand_mask=ligand_mask
+            ligand_mask=ligand_mask,
+            node_batch=all_node_batch  # Pass batch info for cross-attention
         )
         
         ligand_node_h = node_h[ligand_mask]
