@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Module, Sequential, Linear, Conv1d, ModuleList
 from torch_scatter import scatter_sum, scatter_softmax
-from torch_geometric.nn import radius_graph, knn_graph
+from torch_geometric.nn import radius_graph, knn_graph, knn
 from models.common import GaussianSmearing, MLP, NONLINEARITIES
 import math
 
@@ -179,8 +179,6 @@ class EfficientCrossAttentionBlock(Module):
         """
         Efficient cross-attention using sparse neighbor connections.
         """
-        from torch_geometric.nn import knn
-        
         N_lig = ligand_h.size(0)
         device = ligand_h.device
         
@@ -189,11 +187,12 @@ class EfficientCrossAttentionBlock(Module):
         protein_h_norm = self.layer_norm_kv(protein_h)
         
         # Find k-nearest protein neighbors for each ligand atom
-        # knn returns: edge_index where edge_index[0] are protein indices (targets)
-        # and edge_index[1] are ligand indices (sources)
+        # knn(x, y, ...) returns edge_index where:
+        #   edge_index[0] = indices in y (ligand, the query points)
+        #   edge_index[1] = indices in x (protein, the neighbor points)
         edge_index = knn(protein_pos, ligand_pos, k=self.max_neighbors,
                          batch_x=protein_batch, batch_y=ligand_batch)
-        prot_idx, lig_idx = edge_index  # (E,), (E,)
+        lig_idx, prot_idx = edge_index  # Fixed: was incorrectly swapped before
         
         # Compute Q, K, V
         Q = self.q_proj(ligand_h_norm).view(N_lig, self.num_heads, self.head_dim)
