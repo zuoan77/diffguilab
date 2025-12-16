@@ -230,6 +230,8 @@ class EfficientCrossAttentionBlock(Module):
         # FFN with residual
         ligand_h = ligand_h + self.ffn(self.layer_norm_ffn(ligand_h))
         
+        # 临时调试用
+        print(f"Ligand: {ligand_h.shape}, Protein: {protein_h.shape}, Batch Mask: {batch_mask.shape}")
         return ligand_h
 
 
