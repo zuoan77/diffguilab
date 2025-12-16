@@ -1,6 +1,6 @@
 
-ckpt/
-logs/
+ckpt
+logs
 
 修改日志.txt
 __pycache__/
@@ -9,8 +9,8 @@ __pycache__/
 .Python
 env/
 venv/
-outputs/
+outputs
 tmp/
-sample_del/
-data/
+sample_del
+data
 sample
