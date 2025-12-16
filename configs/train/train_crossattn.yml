@@ -53,8 +53,8 @@ model:
 
 train:
   seed: 2023
-  batch_size: 4
-  num_workers: 4
+  batch_size: 12
+  num_workers: 8
   threshold: 0.1
   pin_memory: True
   max_iters: 250000
