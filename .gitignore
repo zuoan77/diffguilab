@@ -1,0 +1,17 @@
+
+ckpt/
+
+logs/
+
+修改日志.txt
+__pycache__/
+*.py[cod]
+*.class
+.Python
+env/
+venv/
+outputs/
+tmp/
+sample_del/
+
+sample
