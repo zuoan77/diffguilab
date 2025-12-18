@@ -18,12 +18,12 @@ model:
     use_gate: True
     # Cross-attention configuration for ligand-protein interaction
     use_cross_attention: True
-    cross_attention_type: full  # 'full' for small pockets, 'efficient' for large pockets
-    cross_attention_freq: 2          # Apply cross-attention every N EGNN blocks
+    cross_attention_type: efficient  # 'full' for small pockets, 'efficient' for large pockets
+    cross_attention_freq: 3          # Apply cross-attention every N EGNN blocks
     cross_attention_heads: 4         # Number of attention heads
     cross_attention_dropout: 0.1     # Dropout rate in cross-attention
-    cross_attention_cutoff: 15.0     # Distance cutoff for positional encoding
-    cross_attention_max_neighbors: 64  # Max protein neighbors per ligand atom (efficient mode)
+    cross_attention_cutoff: 12.0     # Distance cutoff for positional encoding
+    cross_attention_max_neighbors: 32  # Max protein neighbors per ligand atom (efficient mode)
   diff:
     num_timesteps: 1000
     time_dim: 10

@@ -21,6 +21,27 @@ from utils.misc import *
 from utils.train_utils import *
 
 
+def archive_code_to_logdir(log_dir):
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    archive_dir = os.path.join(log_dir, 'code')
+    os.makedirs(archive_dir, exist_ok=True)
+    allowed_ext = {'.py', '.yml', '.yaml', '.json', '.sh', '.ipynb', '.md', '.txt'}
+    exclude_dirs = {'logs', 'ckpt', 'data', 'outputs', '__pycache__', 'env', 'venv', '.git'}
+    for root, dirs, files in os.walk(base_dir):
+        rel_root = os.path.relpath(root, base_dir)
+        if rel_root == '.':
+            rel_root = ''
+        dirs[:] = [d for d in dirs if d not in exclude_dirs]
+        for name in files:
+            ext = os.path.splitext(name)[1]
+            if ext in allowed_ext:
+                src_path = os.path.join(root, name)
+                dst_root = os.path.join(archive_dir, rel_root)
+                os.makedirs(dst_root, exist_ok=True)
+                dst_path = os.path.join(dst_root, name)
+                shutil.copy2(src_path, dst_path)
+
+
 def get_auroc(y_true, y_pred):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
@@ -144,6 +165,7 @@ def main(args):
     logger.info(args)
     logger.info(config)
     shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
+    archive_code_to_logdir(log_dir)
 
     # Transforms
     featurizer = transforms.FeatureComplex(
