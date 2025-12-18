@@ -525,16 +525,25 @@ class MolecularPropertyEncoder(nn.Module):
     1. 非线性映射能力提升 - 将标量转换为多维激活向量
     2. 归一化与尺度统一 - 不同范围的属性输出都是 0-1 之间的激活值
     3. 梯度传播更平滑 - 高斯核函数提供良好的局部梯度
+    
+    Args:
+        num_gaussians: 每个属性使用的高斯核数量 (默认 16)
+        embedding_dim: 如果指定，添加投影层将输出映射到该维度；None 表示不添加投影
+        use_null_embedding: 是否使用可学习的 null embedding 处理缺失属性
     """
-    def __init__(self, num_gaussians=16):
+    def __init__(self, num_gaussians=16, embedding_dim=None, use_null_embedding=True):
         super().__init__()
+        
+        # 属性名称列表（保持顺序）
+        self.property_names = ['logp', 'tpsa', 'sa', 'qed', 'aff']
+        
         # 定义每个属性的合理物理范围 (根据 PDBBind 或 ZINC 数据库统计)
         self.config = {
             'logp': {'start': -5.0, 'stop': 12.0},   # logP 范围
             'tpsa': {'start': 0.0, 'stop': 200.0},   # 极性表面积
             'sa':   {'start': 1.0, 'stop': 10.0},    # 合成可及性 (1最易-10最难)
             'qed':  {'start': 0.0, 'stop': 1.0},     # 药物相似性
-            'aff':  {'start': 0.0, 'stop': 15.0}     # 亲和力 (pKd/pKi 通常在 2-12 之间)
+            'aff':  {'start': 0.0, 'stop': 15.0}     # 亲和力 (pKd/pKi，线性间隔因为已经是 log scale)
         }
         
         self.encoders = nn.ModuleDict()
@@ -547,9 +556,34 @@ class MolecularPropertyEncoder(nn.Module):
             )
             
         self.num_gaussians = num_gaussians
-        self.out_dim = 5 * num_gaussians  # 最终输出维度
+        self.num_properties = len(self.property_names)
+        self.raw_out_dim = self.num_properties * num_gaussians  # 高斯编码后的原始维度
+        
+        # 可学习的 null embedding，用于处理缺失属性
+        self.use_null_embedding = use_null_embedding
+        if use_null_embedding:
+            self.null_embeddings = nn.ParameterDict({
+                key: nn.Parameter(torch.zeros(num_gaussians))
+                for key in self.property_names
+            })
+            # 初始化为小的随机值
+            for param in self.null_embeddings.values():
+                nn.init.normal_(param, mean=0.0, std=0.01)
+        
+        # 可选的投影层，用于特征融合
+        self.embedding_dim = embedding_dim
+        if embedding_dim is not None:
+            self.out_proj = nn.Sequential(
+                nn.Linear(self.raw_out_dim, embedding_dim),
+                nn.SiLU(),
+                nn.Linear(embedding_dim, embedding_dim)
+            )
+            self.out_dim = embedding_dim
+        else:
+            self.out_proj = None
+            self.out_dim = self.raw_out_dim
 
-    def forward(self, logp, tpsa, sa, qed, aff):
+    def forward(self, logp, tpsa, sa, qed, aff, mask=None):
         """
         对分子属性进行高斯编码。
         
@@ -559,23 +593,82 @@ class MolecularPropertyEncoder(nn.Module):
             sa:   (Batch,) 或 (Batch, 1) - 合成可及性
             qed:  (Batch,) 或 (Batch, 1) - 药物相似性
             aff:  (Batch,) 或 (Batch, 1) - 结合亲和力
+            mask: (Batch, 5) 或 None - 属性掩码，1 表示有效，0 表示缺失/忽略
+                  顺序为 [logp, tpsa, sa, qed, aff]
+                  如果为 None，则所有属性都视为有效
             
         Returns:
-            (Batch, 5 * num_gaussians) - 编码后的特征向量
+            (Batch, out_dim) - 编码后的特征向量
         """
-        # 确保输入是 1D 张量
-        logp = logp.view(-1)
-        tpsa = tpsa.view(-1)
-        sa = sa.view(-1)
-        qed = qed.view(-1)
-        aff = aff.view(-1)
+        # 收集输入并确保形状正确
+        props = {
+            'logp': logp.view(-1),
+            'tpsa': tpsa.view(-1),
+            'sa': sa.view(-1),
+            'qed': qed.view(-1),
+            'aff': aff.view(-1)
+        }
+        batch_size = props['logp'].size(0)
+        device = props['logp'].device
         
-        # 依次编码
-        feat_logp = self.encoders['logp'](logp)  # (Batch, num_gaussians)
-        feat_tpsa = self.encoders['tpsa'](tpsa)
-        feat_sa   = self.encoders['sa'](sa)
-        feat_qed  = self.encoders['qed'](qed)
-        feat_aff  = self.encoders['aff'](aff)
+        # 依次编码每个属性
+        encoded_features = []
+        for i, key in enumerate(self.property_names):
+            feat = self.encoders[key](props[key])  # (Batch, num_gaussians)
+            
+            # 处理缺失值
+            if mask is not None and self.use_null_embedding:
+                # mask[:, i] 为 0 表示该属性缺失
+                prop_mask = mask[:, i:i+1]  # (Batch, 1)
+                null_emb = self.null_embeddings[key].unsqueeze(0).expand(batch_size, -1)  # (Batch, num_gaussians)
+                feat = feat * prop_mask + null_emb * (1 - prop_mask)
+            
+            encoded_features.append(feat)
         
-        # 拼接: (Batch, 5 * num_gaussians)
-        return torch.cat([feat_logp, feat_tpsa, feat_sa, feat_qed, feat_aff], dim=-1)
+        # 拼接所有属性: (Batch, 5 * num_gaussians)
+        encoded = torch.cat(encoded_features, dim=-1)
+        
+        # 可选的投影
+        if self.out_proj is not None:
+            encoded = self.out_proj(encoded)
+        
+        return encoded
+    
+    def expand_to_nodes(self, graph_features, batch_index):
+        """
+        将图级别的特征广播到节点级别。
+        
+        用于将 (Batch_Size, Feat) 的条件向量扩展到 (Num_All_Nodes, Feat)，
+        以便与节点特征融合。
+        
+        Args:
+            graph_features: (Batch_Size, Feat) - 图级别的编码特征
+            batch_index: (Num_All_Nodes,) - 每个节点对应的图索引
+            
+        Returns:
+            (Num_All_Nodes, Feat) - 节点级别的特征
+        """
+        return graph_features[batch_index]
+    
+    def encode_with_cfg_mask(self, logp, tpsa, sa, qed, aff, drop_prob=0.1):
+        """
+        带 Classifier-Free Guidance 掩码的编码。
+        
+        以 drop_prob 的概率将整个条件向量置零（用于 CFG 训练）。
+        
+        Args:
+            logp, tpsa, sa, qed, aff: 属性值
+            drop_prob: 丢弃条件的概率
+            
+        Returns:
+            (Batch, out_dim) - 编码后的特征向量（部分可能被置零）
+        """
+        encoded = self.forward(logp, tpsa, sa, qed, aff)
+        batch_size = encoded.size(0)
+        
+        # 随机生成掩码
+        drop_mask = torch.rand(batch_size, 1, device=encoded.device) < drop_prob
+        encoded = encoded * (~drop_mask).float()
+        
+        return encoded
+

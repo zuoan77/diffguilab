@@ -60,20 +60,18 @@ def train(args, config, model, property_encoder, train_iterator, optimizer, scal
     batch = next(train_iterator).to(args.device)
     batch_size = batch.num_graphs
 
-    # 使用高斯编码处理分子属性
+    # 使用高斯编码处理分子属性（带 CFG 掩码）
     raw_logp = torch.tensor([float(item) for item in batch.logp], device=args.device)
     raw_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device)
     raw_sa = torch.tensor([float(item) for item in batch.sa], device=args.device)
     raw_qed = torch.tensor([float(item) for item in batch.qed], device=args.device)
     raw_aff = torch.tensor([float(item) for item in batch.aff], device=args.device)
     
-    # 高斯编码: (Batch_size, 5 * num_gaussians)
-    batch_lab = property_encoder(raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff)
-    
-    # Masking (随机丢弃条件，用于 Classifier-Free Guidance)
-    # 将整个向量置零
-    mask_indices = np.where(np.random.rand(batch_size) < config.train.threshold)[0]
-    batch_lab[mask_indices] = 0.0
+    # 高斯编码 + CFG 掩码: (Batch_size, out_dim)
+    batch_lab = property_encoder.encode_with_cfg_mask(
+        raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff,
+        drop_prob=config.train.threshold
+    )
     
     protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
     pos_noise = torch.randn_like(batch.ligand_pos) * config.train.pos_noise_std
@@ -120,19 +118,18 @@ def validate(args, config, model, property_encoder, val_loader, scheduler, logge
             batch = batch.to(args.device)
             batch_size = batch.num_graphs
 
-            # 使用高斯编码处理分子属性
+            # 使用高斯编码处理分子属性（带 CFG 掩码）
             raw_logp = torch.tensor([float(item) for item in batch.logp], device=args.device)
             raw_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device)
             raw_sa = torch.tensor([float(item) for item in batch.sa], device=args.device)
             raw_qed = torch.tensor([float(item) for item in batch.qed], device=args.device)
             raw_aff = torch.tensor([float(item) for item in batch.aff], device=args.device)
             
-            # 高斯编码: (Batch_size, 5 * num_gaussians)
-            batch_lab = property_encoder(raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff)
-            
-            # Masking (随机丢弃条件，用于 Classifier-Free Guidance)
-            mask_indices = np.where(np.random.rand(batch_size) < config.train.threshold)[0]
-            batch_lab[mask_indices] = 0.0
+            # 高斯编码 + CFG 掩码: (Batch_size, out_dim)
+            batch_lab = property_encoder.encode_with_cfg_mask(
+                raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff,
+                drop_prob=config.train.threshold
+            )
 
             with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=config.train.use_amp):
                 loss_dict, pred_dict = model.get_loss(
