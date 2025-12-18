@@ -50,6 +50,18 @@ class DiffGui(Module):
         self.time_emb = nn.Sequential(
             GaussianSmearing(stop=self.num_timesteps, num_gaussians=time_dim, type_='linear'),
         )
+        
+        # 分子属性高斯编码器 (替代原来的 class_emb)
+        # class_dim 现在是高斯编码后的维度 (5 * num_gaussians = 80)
+        num_gaussians = class_dim // 5
+        self.property_encoder = MolecularPropertyEncoder(
+            num_gaussians=num_gaussians,
+            embedding_dim=class_emb_dim,  # 投影到 class_emb_dim 维度
+            use_null_embedding=True
+        )
+        
+        # 保留原来的 class_emb 用于向后兼容 (接收预编码的特征)
+        # 当 batch_lab 已经是高斯编码后的向量时，直接投影
         self.class_emb = nn.Sequential(
             nn.Linear(class_dim, class_emb_dim * 4),
             nn.LayerNorm(class_emb_dim * 4),
@@ -342,7 +354,9 @@ class DiffGui(Module):
     ):
         """
         Compute new results for the start step in classifier free diffusion sampling.
+        使用高斯编码后的 batch_lab，通过置零实现 unconditional 预测。
         """
+        # Conditional 预测
         preds_cond = self(
             protein_node, protein_pos, protein_batch,
             ligand_node_pert, ligand_pos_pert, ligand_batch,
@@ -350,12 +364,13 @@ class DiffGui(Module):
             time_step, batch_lab
         )
 
-        batch_lab_zero = torch.zeros(batch_lab.shape, device=ligand_batch.device)
+        # Unconditional 预测 (将属性编码置零)
+        batch_lab_zero = torch.zeros_like(batch_lab)
         preds_uncond = self(
             protein_node, protein_pos, protein_batch,
             ligand_node_pert, ligand_pos_pert, ligand_batch,
             ligand_edge_pert, ligand_edge_index, ligand_edge_batch, 
-            time_step, batch_lab
+            time_step, batch_lab_zero  # 使用零向量
         )
 
         pred_eps_cond = self._predict_eps_from_x0(
