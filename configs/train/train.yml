@@ -2,7 +2,7 @@ model:
   name: diffgui
   node_dim: 256
   edge_dim: 64
-  class_dim: 5
+  class_dim: 80  # 5 properties * 16 Gaussians = 80 (高斯编码后的维度)
   class_emb_dim: 10
   edge_feat_dim: 4
   node_indicator: True

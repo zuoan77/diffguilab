@@ -15,6 +15,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import Compose
 
 from models.model import DiffGui
+from models.common import MolecularPropertyEncoder
 import utils.transforms as transforms
 from utils.dataset import get_dataset
 from utils.misc import *
@@ -54,18 +55,25 @@ def get_auroc(y_true, y_pred):
     avg_auroc = sum_auroc / len(y_true)
     return avg_auroc
 
-def train(args, config, model, train_iterator, optimizer, scaler, logger, writer, it):
+def train(args, config, model, property_encoder, train_iterator, optimizer, scaler, logger, writer, it):
     optimizer.zero_grad(set_to_none=True)
     batch = next(train_iterator).to(args.device)
     batch_size = batch.num_graphs
 
-    batch_logp = torch.tensor([float(item) for item in batch.logp], device=args.device).unsqueeze(-1)
-    batch_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device).unsqueeze(-1)
-    batch_sa = torch.tensor([float(item) for item in batch.sa], device=args.device).unsqueeze(-1)
-    batch_qed = torch.tensor([float(item) for item in batch.qed], device=args.device).unsqueeze(-1)
-    batch_aff = torch.tensor([float(item) for item in batch.aff], device=args.device).unsqueeze(-1)
-    batch_lab = torch.cat((batch_logp, batch_tpsa, batch_sa, batch_qed, batch_aff), dim=1)
-    batch_lab[np.where(np.random.rand(batch_size)<config.train.threshold)] = 0
+    # 使用高斯编码处理分子属性
+    raw_logp = torch.tensor([float(item) for item in batch.logp], device=args.device)
+    raw_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device)
+    raw_sa = torch.tensor([float(item) for item in batch.sa], device=args.device)
+    raw_qed = torch.tensor([float(item) for item in batch.qed], device=args.device)
+    raw_aff = torch.tensor([float(item) for item in batch.aff], device=args.device)
+    
+    # 高斯编码: (Batch_size, 5 * num_gaussians)
+    batch_lab = property_encoder(raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff)
+    
+    # Masking (随机丢弃条件，用于 Classifier-Free Guidance)
+    # 将整个向量置零
+    mask_indices = np.where(np.random.rand(batch_size) < config.train.threshold)[0]
+    batch_lab[mask_indices] = 0.0
     
     protein_noise = torch.randn_like(batch.protein_pos) * config.train.pos_noise_std
     pos_noise = torch.randn_like(batch.ligand_pos) * config.train.pos_noise_std
@@ -101,7 +109,7 @@ def train(args, config, model, train_iterator, optimizer, scaler, logger, writer
         writer.add_scalar('train/grad', orig_grad_norm, it)
         writer.flush()
 
-def validate(args, config, model, val_loader, scheduler, logger, writer, it):
+def validate(args, config, model, property_encoder, val_loader, scheduler, logger, writer, it):
     sum_n =  0   # num of loss
     sum_loss_dict = {} 
     all_pred_v, all_true_v = [], []
@@ -112,13 +120,19 @@ def validate(args, config, model, val_loader, scheduler, logger, writer, it):
             batch = batch.to(args.device)
             batch_size = batch.num_graphs
 
-            batch_logp = torch.tensor([float(item) for item in batch.logp], device=args.device).unsqueeze(-1)
-            batch_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device).unsqueeze(-1)
-            batch_sa = torch.tensor([float(item) for item in batch.sa], device=args.device).unsqueeze(-1)
-            batch_qed = torch.tensor([float(item) for item in batch.qed], device=args.device).unsqueeze(-1)
-            batch_aff = torch.tensor([float(item) for item in batch.aff], device=args.device).unsqueeze(-1)
-            batch_lab = torch.cat((batch_logp, batch_tpsa, batch_sa, batch_qed, batch_aff), dim=1)
-            batch_lab[np.where(np.random.rand(batch_size)<config.train.threshold)] = 0
+            # 使用高斯编码处理分子属性
+            raw_logp = torch.tensor([float(item) for item in batch.logp], device=args.device)
+            raw_tpsa = torch.tensor([float(item) for item in batch.tpsa], device=args.device)
+            raw_sa = torch.tensor([float(item) for item in batch.sa], device=args.device)
+            raw_qed = torch.tensor([float(item) for item in batch.qed], device=args.device)
+            raw_aff = torch.tensor([float(item) for item in batch.aff], device=args.device)
+            
+            # 高斯编码: (Batch_size, 5 * num_gaussians)
+            batch_lab = property_encoder(raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff)
+            
+            # Masking (随机丢弃条件，用于 Classifier-Free Guidance)
+            mask_indices = np.where(np.random.rand(batch_size) < config.train.threshold)[0]
+            batch_lab[mask_indices] = 0.0
 
             with torch.autocast(device_type='cuda', dtype=torch.float32, enabled=config.train.use_amp):
                 loss_dict, pred_dict = model.get_loss(
@@ -240,9 +254,16 @@ def main(args):
         ).to(args.device)
     else:
         raise NotImplementedError('Model %s not implemented' % config.model.name)
+    
+    # 初始化分子属性高斯编码器
+    num_gaussians = config.model.class_dim // 5  # 从 class_dim 反推 num_gaussians
+    property_encoder = MolecularPropertyEncoder(num_gaussians=num_gaussians).to(args.device)
+    logger.info(f'Property encoder initialized with {num_gaussians} Gaussians per property, output dim: {property_encoder.out_dim}')
+    
     num_parameters = np.sum([p.numel() for p in model.parameters() if p.requires_grad])
     logger.info(f'Num of trainable parameters: {num_parameters / 1e6:.4f} M.')
     logger.info(f'protein feature dim: {featurizer.protein_feat_dim}, ligand atom feature dim: {featurizer.atom_feat_dim}, ligand bond feature dim: {featurizer.bond_feat_dim}.')
+
 
     # Optimizer and scheduler
     optimizer = get_optimizer(config.train.optimizer, model)
@@ -278,12 +299,12 @@ def main(args):
         #best_loss, best_atom_auroc, best_bond_auroc, best_it = 2.417990, 0.934028, 0.956858, 206000
         for it in range(int(resume_step)+1, config.train.max_iters+1):
             try:
-                train(args, config, model, train_iterator, optimizer, scaler, logger, writer, it)
+                train(args, config, model, property_encoder, train_iterator, optimizer, scaler, logger, writer, it)
             except RuntimeError as e:
                 logger.error('Runtime Error ' + str(e))
                 logger.error('Skipping Iteration %d' % it)
             if it % config.train.val_freq == 0 or it == config.train.max_iters:
-                loss_dict = validate(args, config, model, val_loader, scheduler, logger, writer, it)
+                loss_dict = validate(args, config, model, property_encoder, val_loader, scheduler, logger, writer, it)
                 if loss_dict['loss'] < best_loss:
                     best_loss, best_atom_auroc, best_bond_auroc, best_it = loss_dict['loss'], loss_dict['atom_auroc'], loss_dict['bond_auroc'], it
                     ckpt_path = os.path.join(success_ckpt_dir, '%d.pt' % it)

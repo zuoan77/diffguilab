@@ -516,3 +516,66 @@ if __name__ == '__main__':
     assert torch.allclose(pos_ctx[torch.logical_not(mask_protein)], pos_ligand)
     assert torch.allclose(pos_ctx[mask_protein], pos_protein)
     
+
+class MolecularPropertyEncoder(nn.Module):
+    """
+    将分子标量属性（logP, TPSA, SA, QED, Affinity）编码为高斯径向基函数表示。
+    
+    使用高斯编码的优势：
+    1. 非线性映射能力提升 - 将标量转换为多维激活向量
+    2. 归一化与尺度统一 - 不同范围的属性输出都是 0-1 之间的激活值
+    3. 梯度传播更平滑 - 高斯核函数提供良好的局部梯度
+    """
+    def __init__(self, num_gaussians=16):
+        super().__init__()
+        # 定义每个属性的合理物理范围 (根据 PDBBind 或 ZINC 数据库统计)
+        self.config = {
+            'logp': {'start': -5.0, 'stop': 12.0},   # logP 范围
+            'tpsa': {'start': 0.0, 'stop': 200.0},   # 极性表面积
+            'sa':   {'start': 1.0, 'stop': 10.0},    # 合成可及性 (1最易-10最难)
+            'qed':  {'start': 0.0, 'stop': 1.0},     # 药物相似性
+            'aff':  {'start': 0.0, 'stop': 15.0}     # 亲和力 (pKd/pKi 通常在 2-12 之间)
+        }
+        
+        self.encoders = nn.ModuleDict()
+        for key, limits in self.config.items():
+            self.encoders[key] = GaussianSmearing(
+                start=limits['start'], 
+                stop=limits['stop'], 
+                num_gaussians=num_gaussians,
+                type_='linear'  # 使用线性间隔的高斯核
+            )
+            
+        self.num_gaussians = num_gaussians
+        self.out_dim = 5 * num_gaussians  # 最终输出维度
+
+    def forward(self, logp, tpsa, sa, qed, aff):
+        """
+        对分子属性进行高斯编码。
+        
+        Args:
+            logp: (Batch,) 或 (Batch, 1) - 脂水分配系数
+            tpsa: (Batch,) 或 (Batch, 1) - 极性表面积
+            sa:   (Batch,) 或 (Batch, 1) - 合成可及性
+            qed:  (Batch,) 或 (Batch, 1) - 药物相似性
+            aff:  (Batch,) 或 (Batch, 1) - 结合亲和力
+            
+        Returns:
+            (Batch, 5 * num_gaussians) - 编码后的特征向量
+        """
+        # 确保输入是 1D 张量
+        logp = logp.view(-1)
+        tpsa = tpsa.view(-1)
+        sa = sa.view(-1)
+        qed = qed.view(-1)
+        aff = aff.view(-1)
+        
+        # 依次编码
+        feat_logp = self.encoders['logp'](logp)  # (Batch, num_gaussians)
+        feat_tpsa = self.encoders['tpsa'](tpsa)
+        feat_sa   = self.encoders['sa'](sa)
+        feat_qed  = self.encoders['qed'](qed)
+        feat_aff  = self.encoders['aff'](aff)
+        
+        # 拼接: (Batch, 5 * num_gaussians)
+        return torch.cat([feat_logp, feat_tpsa, feat_sa, feat_qed, feat_aff], dim=-1)

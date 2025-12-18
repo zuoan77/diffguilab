@@ -16,6 +16,7 @@ from torch_scatter import scatter_sum
 from torch_geometric.data import Batch
 from models.model import DiffGui
 from models.bond_predictor import BondPredictor
+from models.common import MolecularPropertyEncoder
 from utils.sample_utils import seperate_outputs
 from torch_geometric.transforms import Compose
 from utils.evaluation.atom_num_config import CONFIG
@@ -134,16 +135,24 @@ def main(args):
     model.load_state_dict(ckpt['model'])
     model.eval()
     
-    # label
-    logp = torch.tensor([float(config.model.logp)], device=args.device).unsqueeze(-1)
-    tpsa = torch.tensor([float(config.model.tpsa)], device=args.device).unsqueeze(-1)
-    sa = torch.tensor([float(config.model.sa)], device=args.device).unsqueeze(-1)
-    qed = torch.tensor([float(config.model.qed)], device=args.device).unsqueeze(-1)
-    aff = torch.tensor([float(config.model.aff)], device=args.device).unsqueeze(-1)
-    batch_lab = torch.cat((logp, tpsa, sa, qed, aff), dim=1)
+    # 初始化分子属性高斯编码器
+    num_gaussians = train_config.model.class_dim // 5
+    property_encoder = MolecularPropertyEncoder(num_gaussians=num_gaussians).to(args.device)
+    logger.info(f'Property encoder initialized with {num_gaussians} Gaussians per property')
+    
+    # label - 使用高斯编码
+    raw_logp = torch.tensor([float(config.model.logp)], device=args.device)
+    raw_tpsa = torch.tensor([float(config.model.tpsa)], device=args.device)
+    raw_sa = torch.tensor([float(config.model.sa)], device=args.device)
+    raw_qed = torch.tensor([float(config.model.qed)], device=args.device)
+    raw_aff = torch.tensor([float(config.model.aff)], device=args.device)
+    
+    # 高斯编码: (1, 5 * num_gaussians)
+    batch_lab_single = property_encoder(raw_logp, raw_tpsa, raw_sa, raw_qed, raw_aff)
 
     batch_size = config.sample.batch_size
-    batch_lab = torch.tensor([list(batch_lab[0]) for _ in range(batch_size)]).to(args.device)
+    # 扩展到 batch_size
+    batch_lab = batch_lab_single.repeat(batch_size, 1)
 
     # # Bond predictor and guidance
     if 'bond_predictor' in config:
